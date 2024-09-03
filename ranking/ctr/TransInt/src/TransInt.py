@@ -1,0 +1,121 @@
+import torch
+import torch.nn as nn
+from einops import rearrange, repeat
+from einops.layers.torch import Rearrange
+
+from fuxictr.pytorch.layers import FeatureEmbedding
+from fuxictr.pytorch.models import BaseModel
+
+
+class TransInt(BaseModel):
+    def __init__(self,
+                 feature_map,
+                 model_id="TransInt",
+                 gpu=-1,
+                 learning_rate=1e-3,
+                 regularizer=None,
+                 embedding_dim=10,
+                 **kwargs):
+        super(TransInt, self).__init__(feature_map,
+                                       model_id=model_id,
+                                       gpu=gpu,
+                                       embedding_regularizer=regularizer,
+                                       net_regularizer=regularizer,
+                                       **kwargs)
+        self.embedding_layer = FeatureEmbedding(feature_map, embedding_dim=embedding_dim)
+        self.transformer = Transformer(dim=10, depth=4, heads=4, dim_head=16, mlp_dim=128, dropout=0.1)
+        self.linear = nn.Sequential(
+            nn.Linear(embedding_dim * len(feature_map.features), 128),
+            nn.ReLU(),
+            nn.Linear(128, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1)
+        )
+        self.compile(kwargs["optimizer"], kwargs["loss"], learning_rate)
+        self.reset_parameters()
+        self.model_to_device()
+
+    def forward(self, inputs):
+        X = self.get_inputs(inputs)     # dict[feat_name, fea_value]
+
+        feature_emb = self.embedding_layer(X, flatten_emb=False)
+        output = self.transformer(feature_emb)
+        output = output.view([output.shape[0], -1])
+        output = self.linear(output)
+
+        y_pred = self.output_activation(output)
+        return_dict = {"y_pred": y_pred}
+
+        return return_dict
+
+
+class FeedForward(nn.Module):
+    def __init__(self, dim, hidden_dim, dropout=0.):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, dim),
+            nn.Dropout(dropout)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class Attention(nn.Module):
+    def __init__(self, dim, heads = 8, dim_head = 64, dropout = 0.):
+        super().__init__()
+        inner_dim = dim_head *  heads
+        project_out = not (heads == 1 and dim_head == dim)
+
+        self.heads = heads
+        self.scale = dim_head ** -0.5
+
+        self.norm = nn.LayerNorm(dim)
+
+        self.attend = nn.Softmax(dim = -1)
+        self.dropout = nn.Dropout(dropout)
+
+        self.to_qkv = nn.Linear(dim, inner_dim * 3, bias = False)
+
+        self.to_out = nn.Sequential(
+            nn.Linear(inner_dim, dim),
+            nn.Dropout(dropout)
+        ) if project_out else nn.Identity()
+
+    def forward(self, x):
+        x = self.norm(x)
+
+        qkv = self.to_qkv(x).chunk(3, dim = -1)
+        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = self.heads), qkv)
+
+        dots = torch.matmul(q, k.transpose(-1, -2)) * self.scale
+
+        attn = self.attend(dots)
+        attn = self.dropout(attn)
+
+        out = torch.matmul(attn, v)
+        out = rearrange(out, 'b h n d -> b n (h d)')
+        return self.to_out(out)
+
+
+class Transformer(nn.Module):
+    def __init__(self, dim, depth, heads, dim_head, mlp_dim, dropout=0.):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+        self.layers = nn.ModuleList([])
+        for _ in range(depth):
+            self.layers.append(nn.ModuleList([
+                Attention(dim, heads = heads, dim_head = dim_head, dropout = dropout),
+                FeedForward(dim, mlp_dim, dropout = dropout)
+            ]))
+
+    def forward(self, x):
+        for attn, ff in self.layers:
+            x = attn(x) + x
+            x = ff(x) + x
+
+        return self.norm(x)
